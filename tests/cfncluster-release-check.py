@@ -26,7 +26,9 @@
 #   (value does not matter). That subnet will be used as the launch
 #   target for the cluster.
 
+import datetime
 import os
+import signal
 import sys
 import subprocess
 import threading
@@ -34,6 +36,7 @@ import re
 import argparse
 import Queue
 import boto3
+import process_helper as prochelp
 
 #
 # configuration
@@ -53,12 +56,19 @@ results_lock = threading.Lock()
 failure = 0
 success = 0
 
+_TIMESTAMP_FORMAT = '%Y%m%d%H%M%S'
+_timestamp = datetime.datetime.now().strftime(_TIMESTAMP_FORMAT)
+
+
+
+def _dirname():
+    return os.path.dirname(os.path.realpath(sys.argv[0]))
 
 #
 # run a single test, possibly in parallel
 #
 def run_test(region, distro, scheduler, instance_type, key_name, key_path):
-    testname = '%s-%s-%s-%s' % (region, distro, scheduler, instance_type.replace('.', ''))
+    testname = '%s-%s-%s-%s-%s' % (region, distro, scheduler, instance_type.replace('.', ''), _timestamp)
     test_filename = "%s-config.cfg" % testname
 
     sys.stdout.write("--> %s: Starting\n" % (testname))
@@ -97,12 +107,12 @@ def run_test(region, distro, scheduler, instance_type, key_name, key_path):
 
     try:
         # build the cluster
-        subprocess.check_call(['cfncluster', '--config', test_filename,
+        prochelp.exec_command(['cfncluster', '--config', test_filename,
                                'create', testname],
                               stdout=stdout_f, stderr=stderr_f)
 
         # get the master ip, which means grepping through cfncluster status gorp
-        dump = subprocess.check_output(['cfncluster', '--config', test_filename,
+        dump = prochelp.exec_command(['cfncluster', '--config', test_filename,
                                         'status', testname], stderr=stderr_f)
         dump_array = dump.splitlines()
         for line in dump_array:
@@ -127,9 +137,9 @@ def run_test(region, distro, scheduler, instance_type, key_name, key_path):
         if key_path:
             ssh_params.extend(['-i', key_path])
 
-        subprocess.check_call(['scp'] + ssh_params + ['cluster-check.sh', '%s@%s:.' % (username, master_ip)],
+        prochelp.exec_command(['scp'] + ssh_params + [os.path.join(_dirname(), 'cluster-check.sh'), '%s@%s:.' % (username, master_ip)],
                               stdout=stdout_f, stderr=stderr_f)
-        subprocess.check_call(
+        prochelp.exec_command(
             ['ssh', '-n'] + ssh_params + ['%s@%s' % (username, master_ip), '/bin/bash --login cluster-check.sh %s' % scheduler],
             stdout=stdout_f, stderr=stderr_f)
 
@@ -140,7 +150,7 @@ def run_test(region, distro, scheduler, instance_type, key_name, key_path):
 
     finally:
         # clean up the cluster
-        subprocess.call(['cfncluster', '--config', test_filename, 'delete', testname],
+        subprocess.call(['cfncluster', '--config', test_filename, '-nw', 'delete', testname],
                         stdout=stdout_f, stderr=stderr_f)
         if exception_raised:
             stdout_f.write('FAILURE: %s!!\n' % (testname))
@@ -183,8 +193,14 @@ def test_runner(region, q, key_name, key_path):
         results_lock.release()
         q.task_done()
 
+def _bind_term_signals():
+    signal.signal(signal.SIGHUP, prochelp.term_handler)
+    signal.signal(signal.SIGINT, prochelp.term_handler)
+    signal.signal(signal.SIGTERM, prochelp.term_handler)
 
 if __name__ == '__main__':
+    _bind_term_signals()
+
     config = { 'parallelism' : 3,
                'regions' : 'us-east-1,us-east-2,us-west-1,us-west-2,' +
                            'ca-central-1,eu-west-1,eu-west-2,eu-central-1,' +
