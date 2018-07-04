@@ -32,6 +32,7 @@ import signal
 import sys
 import subprocess
 import threading
+import time
 import re
 import argparse
 import Queue
@@ -55,6 +56,7 @@ setup = {}
 results_lock = threading.Lock()
 failure = 0
 success = 0
+aborted = 0
 
 _TIMESTAMP_FORMAT = '%Y%m%d%H%M%S'
 _timestamp = datetime.datetime.now().strftime(_TIMESTAMP_FORMAT)
@@ -63,6 +65,9 @@ _timestamp = datetime.datetime.now().strftime(_TIMESTAMP_FORMAT)
 
 def _dirname():
     return os.path.dirname(os.path.realpath(sys.argv[0]))
+
+def _time():
+    return datetime.datetime.now()
 
 #
 # run a single test, possibly in parallel
@@ -98,19 +103,18 @@ def run_test(region, distro, scheduler, instance_type, key_name, key_path):
     file.write("scaling_cooldown = 300\n")
     file.close()
 
-    stdout_f = open('%s-stdout.txt' % testname, 'w')
-    stderr_f = open('%s-stderr.txt' % testname, 'w')
+    stdout_f = open('%s-stdout.txt' % testname, 'w', 0)
+    stderr_f = open('%s-stderr.txt' % testname, 'w', 0)
 
     master_ip = ''
     username = username_map[distro]
-    exception_raised = False;
-
+    _create_interrupted = False;
+    _create_done = False;
     try:
         # build the cluster
-        prochelp.exec_command(['cfncluster', '--config', test_filename,
-                               'create', testname],
+        prochelp.exec_command(['cfncluster', '--config', test_filename, 'create', testname],
                               stdout=stdout_f, stderr=stderr_f)
-
+        _create_done = True
         # get the master ip, which means grepping through cfncluster status gorp
         dump = prochelp.exec_command(['cfncluster', '--config', test_filename,
                                         'status', testname], stderr=stderr_f)
@@ -121,10 +125,9 @@ def run_test(region, distro, scheduler, instance_type, key_name, key_path):
                 master_ip = m.group(1)
                 break
         if master_ip == '':
-            stderr_f.write('!! %s: Master IP not found; aborting !!' % (testname))
-            exception_raised = True
+            stderr_f.write('!! %s: Master IP not found; aborting !!\n' % (testname))
             raise Exception('Master IP not found')
-        stdout_f.write("--> %s master ip: %s" % (testname, master_ip))
+        stdout_f.write("--> %s master ip: %s\n" % (testname, master_ip))
         print("--> %s master ip: %s" % (testname, master_ip))
 
         # run test on the cluster...
@@ -139,30 +142,71 @@ def run_test(region, distro, scheduler, instance_type, key_name, key_path):
 
         prochelp.exec_command(['scp'] + ssh_params + [os.path.join(_dirname(), 'cluster-check.sh'), '%s@%s:.' % (username, master_ip)],
                               stdout=stdout_f, stderr=stderr_f)
-        prochelp.exec_command(
-            ['ssh', '-n'] + ssh_params + ['%s@%s' % (username, master_ip), '/bin/bash --login cluster-check.sh %s' % scheduler],
-            stdout=stdout_f, stderr=stderr_f)
+        # prochelp.exec_command(
+        #     ['ssh', '-n'] + ssh_params + ['%s@%s' % (username, master_ip), '/bin/bash --login cluster-check.sh %s' % scheduler],
+        #     stdout=stdout_f, stderr=stderr_f)
 
-    except Exception as e:
-        stderr_f.write("!! FAILURE: %s!!\n" % (testname))
-        exception_raised = True
-        raise e
-
+        stdout_f.write('SUCCESS:  %s!!\n' % (testname))
+        open('%s.success' %testname, 'w').close()
+    except prochelp.ProcessHelperError as exc:
+        if isinstance(exc, prochelp.KilledProcessError) and not _create_done:
+            _create_interrupted = True
+            print("[%s][%s]xxx cfncluster create interrupted" % (_time(), testname))
+        sys.stdout.write('!! ABORTED: %s!!\n' % (testname))
+        stdout_f.write('ABORTED: %s!!\n' % (testname))
+        open('%s.aborted' % testname, 'w').close()
+        raise exc
+    except Exception as exc:
+        print("xxx Unexpected exception %s: %s\n" % (str(type(exc)), str((exc))))
+        stderr_f.write("Unexpected exception %s: %s" % (str(type(exc)), str((exc))))
+        sys.stdout.write("!! FAILURE: %s!!\n" % (testname))
+        stdout_f.write('FAILURE: %s!!\n' % (testname))
+        open('%s.failed' % testname, 'w').close()
+        raise exc
     finally:
-        # clean up the cluster
-        subprocess.call(['cfncluster', '--config', test_filename, '-nw', 'delete', testname],
-                        stdout=stdout_f, stderr=stderr_f)
-        if exception_raised:
-            stdout_f.write('FAILURE: %s!!\n' % (testname))
-            open('%s.failed' %testname, 'w').close()
+        if _create_done:
+            _del_iters = 1
+        elif _create_interrupted:
+            # if the create process was interrupted it may take few seconds for the stack id to be actually registered
+            _del_iters = 10
         else:
-            stdout_f.write('SUCCESS:  %s!!\n' % (testname))
-            open('%s.success' %testname, 'w').close()
+            # No delete is necessary if the cluster wasn't created
+            _del_iters = 0
+        if _del_iters > 0:
+            _del_done = False
+            stdout_f.write('Deleting: %s - iterations: %s\n' % (testname, _del_iters))
+            while not _del_done and _del_iters > 0:
+                try:
+                    sys.stdout.write("--> %s: Deleting - iterations: %s\n" % (testname, _del_iters))
+                    print("[%s][%s]xxx Before subprocess.call() for cfncluster delete" % (_time(), testname))
+                    # clean up the cluster
+#                    subprocess.call(['cfncluster', '--config', test_filename, '-nw', 'delete', testname],
+#                                    stdout=stdout_f, stderr=stderr_f)
+                    _del_output = subprocess.check_output(['cfncluster', '--config', test_filename, '-nw', 'delete', testname], stderr=stderr_f)
+                    _del_done = "DELETE_IN_PROGRESS" in _del_output or "DELETE_COMPLETE" in _del_output
+                    stdout_f.write(_del_output + '\n')
+                    print("[%s][%s]xxx After subprocess.call() for cfncluster delete - success: %s" % (_time(), testname, _del_done))
+                except CalledProcessError:
+                    pass
+                except (KeyboardInterrupt, Exception) as exc:
+                    stderr_f.write("Unexpected exception on launching 'cfncluster delete' %s: %s" % (str(type(exc)), str((exc))))
+                finally:
+                    if not _del_done and _del_iters > 1:
+                        time.sleep(2)
+                    _del_iters -= 1
 
+            try:
+                print("[%s][%s]xxx Before final cfncluster status" % (_time(), testname))
+                # Uusally terminates with exit status 1 since at the end ofthe delete operartion the stack is not found.
+                prochelp.exec_command(['cfncluster', '--config', test_filename, 'status', testname], stdout=stdout_f, stderr=stderr_f)
+                print("[%s][%s]xxx After final cfncluster status" % (_time(), testname))
+            except Exception as exc:
+                print("[%s][%s]xxx Expected exception for final cfncluster status" % (_time(), testname))
+                pass
         stdout_f.close()
         stderr_f.close()
-        os.remove(test_filename)
-
+        # os.remove(test_filename)
+    sys.stdout.write("--> %s: Finished\n" % (testname))
 
 #
 # worker thread, there will be config['parallelism'] of these running
@@ -182,7 +226,6 @@ def test_runner(region, q, key_name, key_path):
                      instance_type=item['instance_type'], key_name=key_name, key_path=key_path)
             retval = 0
         except Exception as e:
-            print("Unexpected exception %s: %s" % (str(type(e)), str((e))))
             retval = 1
 
         results_lock.acquire(True)
@@ -194,9 +237,9 @@ def test_runner(region, q, key_name, key_path):
         q.task_done()
 
 def _bind_term_signals():
-    signal.signal(signal.SIGHUP, prochelp.term_handler)
     signal.signal(signal.SIGINT, prochelp.term_handler)
     signal.signal(signal.SIGTERM, prochelp.term_handler)
+    signal.signal(signal.SIGHUP, prochelp.term_handler)
 
 if __name__ == '__main__':
     _bind_term_signals()
@@ -237,11 +280,12 @@ if __name__ == '__main__':
     instance_type_list = config['instance_types'].split(',')
 
     print("==> Regions: %s" % (', '.join(region_list)))
+    print("==> Instance Types: %s" % (', '.join(instance_type_list)))
     print("==> Distros: %s" % (', '.join(distro_list)))
     print("==> Schedulers: %s" % (', '.join(scheduler_list)))
     print("==> Parallelism: %d" % (config['parallelism']))
-    print("==> Instance Types: %s" % (', '.join(instance_type_list)))
     print("==> Key Pair: %s" % (config['key_name']))
+
     if config['key_path']:
         print("==> Key Path: %s" % (config['key_path']))
 
@@ -265,7 +309,6 @@ if __name__ == '__main__':
 
         setup[region] = { 'vpc' : vpcid, 'subnet' : subnetid }
 
-
     work_queues = {}
     # build up a per-region list of work to do
     for region in region_list:
@@ -284,9 +327,24 @@ if __name__ == '__main__':
             t.daemon = True
             t.start()
 
+
+    # WARN: The join() approach prevents the SIGINT signal to be caught from the main thread,
+    #       that is actually blocked in the join!
     # wait for all the work queues to be completed in each region
-    for region in region_list:
-        work_queues[region].join()
+    # for region in region_list:
+    #    work_queues[region].join()
+    all_finished = False
+    while not all_finished:
+        time.sleep(1)
+        all_finished = True
+        for queue in work_queues.values():
+            all_finished = all_finished and queue.unfinished_tasks == 0
+
+    print("%s - Empty reqions queues: %s" % (datetime.datetime.now(), all_finished))
+
+    # for region in region_list:
+    #     work_queues[region].join()
+    # print("%s - End queues join()!" % datetime.datetime.now())
 
     # print status...
     print("==> Success: %d" % (success))

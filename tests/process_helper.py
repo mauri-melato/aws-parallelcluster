@@ -17,11 +17,12 @@
 # It helps with the termination of multiple processes forked by a simple multi-threaded application.
 # All processes are registered internally and if the term_handler() function is registered
 # to handle TERM or INT signals it will kill all the active processes submitted through the exec_command() function.
-# Killed processes would make the exec_command() function to raise a CalledProcessError that can be managed
-# by the client application.
+# Killed processes would make the exec_command() function to raise an Exception (either AbortedProcessError,
+# KilledProcessError or CalledProcessError) that can be managed by the client application.
 #
 
 import os
+import signal
 import subprocess as sub
 import threading
 
@@ -31,20 +32,39 @@ _procs_lock = threading.Lock()
 
 _termination_caught = False
 
+class ProcessHelperError(Exception):
+    def __init__(self, cmd, msg=None):
+        if msg is None:
+            msg = "Error executing command '%s' was killed" % cmd
+        super(ProcessHelperError, self).__init__(msg)
+        self.cmd = cmd
+
+class AbortedProcessError(ProcessHelperError):
+    def __init__(self, cmd):
+        super(AbortedProcessError, self).__init__(cmd, "Command '%s' was aborted" % cmd)
+
+class KilledProcessError(ProcessHelperError):
+    def __init__(self, cmd):
+        super(KilledProcessError, self).__init__(cmd, "Process for command '%s' was killed" % cmd)
+
+
 #
-# This is supposed to be used as handler for system signals:
+# This function is supposed to be used as handler for system signals:
 #    signal.signal(signal.SIGTERM, ph.term_handler)
 # It manages to kill all the active processes submitted through this module.
-# Killed processes would make the exec_command() function to raise a CalledProcessError
+# Killed processes would make the exec_command() function to raise a KilledProcessError
+# or an AbortedProcessError.
 #
 def term_handler(_signo, _stack_frame):
     global _procs_lock, _procs, _termination_caught
 
     _procs_lock.acquire()
-
-    _termination_caught = True
-    for proc in _procs.values():
-        _kill_process(proc)
+    if not _termination_caught:
+        print("xxxHandler Setting _termination_caught = True")
+        print("xxxHandler _procs.len() %s" % len(_procs))
+        _termination_caught = True
+        for proc in _procs.values():
+            _kill_process(proc)
 
     _procs_lock.release()
 
@@ -81,9 +101,7 @@ def exec_command(*cmdargs, **kwargs):
     global _termination_caught
 
     if _termination_caught:
-        exc = sub.CalledProcessError(-2, " ".join(*cmdargs), "ERROR: the application has been terminated!")
-        exc._process_killed = _termination_caught
-        raise exc
+        raise AbortedProcessError(" ".join(*cmdargs))
 
     DEV_NULL = open(os.devnull, "rb")
     params = {
@@ -101,9 +119,10 @@ def exec_command(*cmdargs, **kwargs):
         stdout = process.communicate()[0]
         exitcode = process.poll()
         if exitcode != 0:
-            exc = sub.CalledProcessError(exitcode, " ".join(*cmdargs), stdout)
-            exc._process_killed = _termination_caught
-            raise exc
+            if _termination_caught:
+                raise KilledProcessError(" ".join(*cmdargs))
+            else:
+                raise sub.CalledProcessError(exitcode, " ".join(*cmdargs), stdout)
         return stdout
     finally:
         DEV_NULL.close()
