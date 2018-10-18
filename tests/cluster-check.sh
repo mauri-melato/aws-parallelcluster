@@ -69,6 +69,12 @@ torque_get_slots() {
 }
 
 submit_launch() {
+    scheduler="$2"
+
+    echo "--> scheduler: $scheduler"
+
+    submit_init ${scheduler}
+
     # in case the scheduler goes nuts, wrap ourselves in a timeout so
     # there's a bounded completion time
     if test "$CHECK_CLUSTER_SUBPROCESS" = ""; then
@@ -76,12 +82,6 @@ submit_launch() {
         timeout -s KILL 9m /bin/bash ./cluster-check.sh "$@"
         exit $?
     fi
-
-    scheduler="$2"
-
-    echo "--> scheduler: $scheduler"
-
-    submit_init ${scheduler}
 
     ${scheduler}_submit
 
